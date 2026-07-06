@@ -25,7 +25,7 @@
 //      keeping the rally alive and matches the inclusive |x|≤half / |z|≤half bound
 //      used everywhere else.
 import type { Vec3 } from '../math/vec3';
-import { BISECT_ITERS } from './constants';
+import { BISECT_ITERS } from '../constants';
 import {
   advance,
   cloneState,

@@ -274,9 +274,10 @@ async function main(): Promise<void> {
   if (serve) {
     assert(serve.arcType === 'serve', 'serve launch has arcType "serve"');
     const speed = Math.hypot(serve.velocity.x, serve.velocity.y, serve.velocity.z);
-    // SERVE_BASE_SPEED=8, uncharged. charge>0 must exceed that (G1: serve is no
-    // longer hardcoded charge 0 / coupled to the spike baseline).
-    assert(speed > 8.01, `charged serve (${speed.toFixed(1)} u/s) is faster than the 8 u/s uncharged baseline`);
+    // M3.0a: SERVE_BASE_SPEED=9 (drag-compensated), uncharged. A charged serve
+    // must exceed that (G1: serve is no longer hardcoded charge 0 / coupled to the
+    // spike baseline). The 8.01 lower bound stays a valid "clearly charged" gate.
+    assert(speed > 8.01, `charged serve (${speed.toFixed(1)} u/s) is faster than the uncharged baseline`);
   }
 
   // M2.8 playtest — TouchResult is BROADCAST (was toucher-only) and carries the

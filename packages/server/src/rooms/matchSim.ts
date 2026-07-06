@@ -17,13 +17,19 @@ import {
   DIVE_LUNGE_MAX,
   DIVE_QUALITY,
   DIVE_STAMINA,
+  NET_SPIN_DAMP,
   buildBallLaunch,
-  ballVelocity,
   diveSuccessProbability,
   overchargeQualityMult,
   resolveIntent,
   resolveNetCollision,
   sweepAngleDeg,
+  scale,
+  applyFidelity,
+  fidelityOf,
+  hashSeed,
+  rallySpinWorld,
+  serveSpinWorld,
   type BallLaunch,
   type DeathCause,
   type DeathEvent,
@@ -119,7 +125,8 @@ export class MatchSim {
       ? solveJumpLoft(originY, Math.abs(player.z), angleDeg, intent.charge)
       : SERVE_LOFT;
 
-    const rawLaunch = buildBallLaunch({
+    // M3.0a §6 — serve sidespin ∝ protractor eccentricity, curving toward the aim.
+    const nominal = buildBallLaunch({
       origin: { x: player.x, y: originY, z: player.z },
       direction: serveUnitDir(player.side, angleDeg, loft),
       baseSpeed,
@@ -128,7 +135,16 @@ export class MatchSim {
       charge: intent.charge, // §1: raw charge, from 0 — no floor
       serverTime: releaseServerTime,
       rngSeed: this.makeSeed(releaseServerTime),
+      omega: serveSpinWorld(angleDeg, player.side),
     });
+    // M3.0a §4 — a serve has no ideal-contact timing window, so its timing
+    // fidelity is 1; only the overcharge penalty degrades it. For a non-overcharged
+    // serve (charge ≤ 1) f = 1, an exact identity — the aim/power stay true (the
+    // protractor is a precision mechanic; the curve comes from sidespin, not random
+    // aim scatter). Overcharging (charge > 1) scatters aim/power and shrinks spin.
+    const f = overchargeQualityMult(intent.charge);
+    const fid = applyFidelity(nominal.velocity, nominal.omega, f, hashSeed(player.id, releaseServerTime));
+    const rawLaunch: BallLaunch = { ...nominal, velocity: fid.velocity, omega: fid.omega };
     // §3: mark jump serves so the client can recolor the ball + trail;
     // grounded serves leave the flag unset (falsy).
     const launch: BallLaunch = isJump ? { ...rawLaunch, isJumpServe: true } : rawLaunch;
@@ -191,10 +207,15 @@ export class MatchSim {
       return this.resolveDive(player, intent, teammates, verdict.ballPos, verdict.distance, verdict.touchServerTime, canAffordDive);
     }
 
-    // §5: overcharge (c > 1.0) worsens the adjudicated quality before it feeds
-    // buildBallLaunch's scatter/height pipeline — applies to every touch.
+    // §5: overcharge (c > 1.0) worsens the reported/stored quality (drives the HUD
+    // + TouchResult; carried on the packet). Unchanged.
     const quality = verdict.quality * overchargeQualityMult(intent.charge);
-    const launch = this.buildReturn(player, intent, mode, verdict.ballPos, quality, verdict.touchServerTime, teammates);
+    // M3.0a §4/§5 — execution fidelity from timing (deltaMs) × overcharge, applied
+    // to the launch geometry/spin (NOT the reported quality). PERFECT + non-overcharged
+    // ⇒ f = 1 ⇒ identity (the intent is executed exactly).
+    const f = fidelityOf(verdict.deltaMs) * overchargeQualityMult(intent.charge);
+    const seed = hashSeed(player.id, verdict.touchServerTime);
+    const launch = this.buildReturn(player, intent, mode, verdict.ballPos, quality, verdict.touchServerTime, teammates, f, seed);
     return { accepted: true, quality, serverTime: verdict.touchServerTime, deltaMs: verdict.deltaMs, launch };
   }
 
@@ -229,7 +250,12 @@ export class MatchSim {
     // teammate (1v1 self-set fallback preserved inside resolveIntent), still
     // subject to the §5 overcharge quality penalty like any other touch.
     const quality = DIVE_QUALITY * overchargeQualityMult(intent.charge);
-    const launch = this.buildReturn(player, intent, 'dig', ballPos, quality, touchServerTime, teammates);
+    // M3.0a §4 — a dive has no clean timing window; its inherently low DIVE_QUALITY
+    // stands in as the fidelity, so a scramble save flies sloppy (wide cone, weak
+    // power, little spin). Same overcharge penalty on top.
+    const f = DIVE_QUALITY * overchargeQualityMult(intent.charge);
+    const seed = hashSeed(player.id, touchServerTime);
+    const launch = this.buildReturn(player, intent, 'dig', ballPos, quality, touchServerTime, teammates, f, seed);
     return { accepted: true, quality, serverTime: touchServerTime, launch, dive: { ...dive, outcome: 'dive_success' } };
   }
 
@@ -244,6 +270,8 @@ export class MatchSim {
     quality: number,
     touchServerTime: number,
     teammates: Vec3[],
+    f: number, // M3.0a §4 execution fidelity (timing × overcharge)
+    seed: number, // deterministic fidelity noise seed = hashSeed(playerId, serverTime)
   ): BallLaunch {
     const intentResult = resolveIntent({
       mode,
@@ -253,7 +281,8 @@ export class MatchSim {
       toucherSide: player.side,
       teammates, // §b.7 2v2 dig targeting
     });
-    const launch = buildBallLaunch({
+    // M3.0a §6 — default spin per mode (spike topspin, dig/set micro-spin).
+    const nominal = buildBallLaunch({
       origin,
       direction: intentResult.direction,
       baseSpeed: intentResult.baseSpeed,
@@ -262,7 +291,11 @@ export class MatchSim {
       charge: intent.charge,
       serverTime: touchServerTime,
       rngSeed: this.makeSeed(touchServerTime),
+      omega: rallySpinWorld(mode, intent.charge, player.side),
     });
+    // M3.0a §4 — execution fidelity: deflect aim, floor power, shrink spin.
+    const fid = applyFidelity(nominal.velocity, nominal.omega, f, seed);
+    const launch: BallLaunch = { ...nominal, velocity: fid.velocity, omega: fid.omega };
     this.lastHitterSide = player.side;
     this.touchState = registerTouch(this.touchState, player.side, player.id);
     this.beginTrajectory(launch);
@@ -329,12 +362,14 @@ export class MatchSim {
     const launch = this.ball.currentLaunch;
     const ev = this.ball.predictedEvent;
     if (!launch || !ev || ev.kind !== 'net') return null;
-    const incomingVel = ballVelocity(launch, ev.atMs);
-    if (!incomingVel) return null;
-    const resolved = resolveNetCollision(ev.pos, incomingVel);
+    // firstEvent (flight-backed) already carries the exact velocity + spin at the
+    // bisected contact instant — no need to re-sample the trajectory.
+    const resolved = resolveNetCollision(ev.pos, ev.vel);
     const next: BallLaunch = {
       origin: resolved.origin,
       velocity: resolved.velocity,
+      // M3.0a §8.4 — the net bleeds off spin: ω ×= NET_SPIN_DAMP on contact.
+      omega: scale(ev.omega, NET_SPIN_DAMP),
       arcType: launch.arcType,
       quality: launch.quality,
       gravity: launch.gravity,

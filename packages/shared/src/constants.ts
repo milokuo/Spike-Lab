@@ -28,10 +28,21 @@ export const OVERCHARGE_QUALITY_PENALTY = 0.5;
 // M2.1 §b.1 retune: lower baselines so uncharged is controllable and full
 // charge (×1.6, see CHARGE_DISTANCE_MULT_SLOPE) recreates the old punchy ball
 // only when earned. See docs/m2.1_plan.md §a/§b.1 for the audit + rationale.
-export const SPIKE_BASE_SPEED = 9; // units/s (was 14)
+// M3.0a §8.3 — velocity compensation (drag calibration). Flight model v2 adds
+// quadratic drag, so the SAME launch speed now lands SHORTER than the old
+// drag-free parabola. To keep every prior round's feel/tuning, the two POWER
+// base-speeds are bumped so a no-spin flat launch lands within ±5% of the old
+// distance (the ONLY sanctioned reason to touch a gameplay base speed — see the
+// serveAnchor.test.ts anchor). Derivation (charge-0.8 flat serve / charge-0.85
+// spike, drag on):
+//   SERVE: 8 → 9.0  (old land 15.51u; base 9.0 lands 15.38u, ratio 0.991)
+//   SPIKE: 9 → 10.0 (old land 16.06u; base 10.0 lands 15.84u, ratio 0.986)
+// dig/set are short lofts and are intentionally NOT recompensated (spec scoped the
+// change to SERVE/SPIKE); their slightly shorter reach is acceptable.
+export const SPIKE_BASE_SPEED = 10; // units/s (M3.0a: was 9, drag-compensated)
 export const DIG_BASE_SPEED = 4.5; // units/s (was 6; moved from intent/direction.ts)
 export const SET_BASE_SPEED = 5.5; // units/s (was 7; moved from intent/direction.ts)
-export const SERVE_BASE_SPEED = 8; // units/s (new — decouples serve from spike, fixes G1)
+export const SERVE_BASE_SPEED = 9; // units/s (M3.0a: was 8, drag-compensated; decouples serve from spike, fixes G1)
 // M2.3 §1: the SERVE_MIN_CHARGE floor is REMOVED — serve charge starts at 0
 // like every other touch, HUD shows the raw value, and an under-charged serve
 // is allowed to fail naturally (net/own-court death, scored to the opponent
@@ -150,3 +161,50 @@ export const SERVE_SPAWN_Z = COURT_HALF_LENGTH + 0.8; // 9.8 (magnitude; caller 
 // WP2 must switch server call sites to this shared constant and delete the
 // server-local definition.
 export const BACK_BOUND_Z = COURT_HALF_LENGTH + 5; // 14
+
+// ===========================================================================
+// M3.0a — flight model v2 (spec §5) + spin presets (§6) + touch fidelity (§4).
+// Folded in from packages/shared/src/physics/constants.ts (WP-P0 lived there so
+// P0 couldn't touch this file; P1 §8.2 merges them here as the single source of
+// truth). NOTHING re-declares these elsewhere.
+// ===========================================================================
+
+// ---- deterministic fixed-step integrator (spec §2) ----
+export const PHYSICS_DT = 1 / 240; // s — fixed integration step
+// Gravity magnitude for the flight model = the existing ball GRAVITY (§2.1
+// "沿用 shared 既有 GRAVITY 值"), so there is exactly one gravity in the codebase.
+export const PHYSICS_GRAVITY = GRAVITY; // units/s^2 (magnitude; applied as -Y)
+// Quadratic drag: a_drag = -DRAG_K·|v|·v. Exposed as a FlightParams function
+// injection point (spec §2.2); this is the P0/P1 constant the default returns.
+export const DRAG_K = 0.02; // /m — spike loses ~8% speed over its flight
+// Magnus: a_magnus = MAGNUS_K·(ω×v). Full-spin spike adds ≈0.8g of downforce.
+export const MAGNUS_K = 0.022;
+// Spin cap (clamped at the touch layer, not in the integrator).
+export const SPIN_MAX = 45; // rad/s
+// Continuous spin decay: dω/dt = -SPIN_DECAY·ω (1s loses ~30%). The integrator
+// applies the exact per-step factor exp(-SPIN_DECAY·dt), computed once per launch.
+export const SPIN_DECAY = 0.35; // /s
+// Fixed bisection iterations for deterministic event-time refinement (spec §5).
+export const BISECT_ITERS = 20;
+
+// ---- default spin per touch mode (spec §6) ----
+// serve sidespin at full protractor eccentricity (|angle| = 90°); scaled by
+// |angle|/90 so a straight (centered) serve carries no sidespin.
+export const SERVE_SIDESPIN_MAX = 20; // rad/s
+// dig/set carry only a token micro-spin (≤ this), scaled by charge.
+export const SPIN_SOFT_MAX = 5; // rad/s
+
+// ---- net contact spin damping (spec §8.4) ----
+export const NET_SPIN_DAMP = 0.5; // ω ×= this when a launch is spawned by a net contact
+
+// ---- touch fidelity — timing→execution noise (spec §4/§5) ----
+// f = clamp01(1 − (|Δ|/FIDELITY_WINDOW_MS)^FIDELITY_EXP), f=1 inside the PERFECT
+// band. The outer edge (f→0) is the OK grading window (reuses the existing band).
+export const FIDELITY_WINDOW_MS = OK_WINDOW_MS; // 300
+export const FIDELITY_EXP = 1.6; // in/out-of-window feel slope
+// Step 1 (direction): worst-timing deflection cone half-angle.
+export const ERR_CONE_MAX_RAD = (18 * Math.PI) / 180; // 18°
+// Step 2 (power): even the worst timing keeps this fraction of |v| (playability floor).
+export const POWER_FLOOR = 0.55;
+// Step 3 (spin): ω ×= f^SPIN_FIDELITY_EXP — spin scatters first, direction after.
+export const SPIN_FIDELITY_EXP = 1.5;

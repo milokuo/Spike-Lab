@@ -112,9 +112,17 @@ export interface BallLaunch {
   // server -> all, CH.BALL_LAUNCH
   origin: Vec3;
   velocity: Vec3;
+  // M3.0a §8.1 — world-space angular velocity (rad/s, right-handed) driving the
+  // flight model's Magnus + spin-decay terms. REQUIRED (a zero vector is a legal,
+  // spin-free launch). Both ends feed it verbatim into the shared flight
+  // integrator, so the curved trajectory is deterministic and drift-free (iron
+  // rule 1). Protocol break vs pre-M3 clients — intentional, no back-compat.
+  omega: Vec3;
   arcType: ArcType;
   quality: number;
-  gravity: number; // units/s^2 (from constants; carried for determinism)
+  // units/s^2 — carried for the packet's self-description. The flight model uses
+  // the shared PHYSICS_GRAVITY (== GRAVITY) constant; this field always equals it.
+  gravity: number;
   serverTime: number; // t0 of this trajectory (authoritative clock)
   rngSeed: number;
   appliedBlocks?: BlockDef[]; // always empty/absent in M2

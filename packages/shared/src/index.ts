@@ -27,6 +27,14 @@ export * from './ballistics/trajectory';
 export * from './ballistics/launch';
 export * from './ballistics/net';
 
+// M3.0a — flight model v2 + spin + touch fidelity.
+export * from './physics/flight';
+export * from './physics/events';
+export * from './physics/spin';
+export * from './physics/spinPresets';
+export * from './physics/fidelity';
+export * from './physics/vecmath';
+
 export * from './kinematics/jump';
 export * from './kinematics/serveSweep';
 

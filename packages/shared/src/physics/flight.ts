@@ -21,7 +21,9 @@
 //   loop). The per-step spin-decay factor exp(-SPIN_DECAY·dt) is computed ONCE per
 //   params (spec §2.4). Identical inputs ⇒ identical bits (asserted in tests).
 import type { Vec3 } from '../math/vec3';
-import { DRAG_K, MAGNUS_K, PHYSICS_DT, PHYSICS_GRAVITY, SPIN_DECAY } from './constants';
+// M3.0a §8.2 — physics tunables now live in the shared constants barrel (folded
+// in from the former physics/constants.ts, which is deleted). One source of truth.
+import { DRAG_K, MAGNUS_K, PHYSICS_DT, PHYSICS_GRAVITY, SPIN_DECAY } from '../constants';
 
 // P0-internal launch pack (spec §2 API). P1 folds `omega` into the wire BallLaunch.
 export interface FlightLaunch {
@@ -161,13 +163,21 @@ interface GridCache {
 
 let gridCache: GridCache | null = null;
 
+// Safety bound on elapsed time. The step integrator is O(elapsed·1/dt), so a query
+// far in the future (e.g. a sampler handed an absolute wall-clock tMs against a
+// launch whose startMs is a small test stamp) would otherwise walk billions of
+// steps and hang. No real ball lives anywhere near this long — the event horizon
+// (MAX_TRAJECTORY_MS ≈ 8s) bounds a live trajectory — so clamping the elapsed here
+// is invisible to every realistic query and only tames the degenerate one.
+const MAX_ELAPSED_S = 60;
+
 export function flightStateAt(
   launch: FlightLaunch,
   tMs: number,
   params: FlightParams = DEFAULT_FLIGHT_PARAMS,
 ): FlightState {
   const dt = params.dt;
-  const elapsedSec = Math.max(0, (tMs - launch.startMs) / 1000);
+  const elapsedSec = Math.min(MAX_ELAPSED_S, Math.max(0, (tMs - launch.startMs) / 1000));
   const nSteps = Math.floor(elapsedSec / dt);
   const rem = elapsedSec - nSteps * dt;
 

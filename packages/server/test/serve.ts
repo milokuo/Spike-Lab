@@ -14,7 +14,6 @@ import {
   SERVE_JUMP_SPEED_MULT,
   SERVE_QUALITY_GROUND,
   SERVE_QUALITY_JUMP,
-  BASE_SCATTER,
   COURT_HALF_LENGTH,
   BACK_BOUND_Z,
   GRAVITY,
@@ -64,41 +63,18 @@ function simWithZeroOffset(): MatchSim {
   return sim;
 }
 
-// Recover the launch's underlying speed (baseSpeed·chargeMult), inverting the
-// buildBallLaunch split: v = (dir.x·s, dir.y·s·hf, dir.z·s) with |dir|=1, so
-// s = sqrt(vx² + vz² + (vy/hf)²). Scatter only rotates the horizontal, preserving
-// its magnitude, so this is exact.
+// M3.0a — buildBallLaunch now emits the NOMINAL velocity (unit dir × baseSpeed ×
+// chargeMult, no scatter/heightFactor); a non-overcharged serve (charge ≤ 1) has
+// fidelity f=1, an exact identity. So |velocity| == baseSpeed·chargeMult directly.
 function recoverSpeed(l: BallLaunch): number {
-  const hf = Math.sqrt(0.5 + 0.5 * l.quality);
-  return Math.hypot(l.velocity.x, l.velocity.z, l.velocity.y / hf);
+  return Math.hypot(l.velocity.x, l.velocity.y, l.velocity.z);
 }
 
-// Replicate buildBallLaunch's deterministic scatter so we can undo it and read
-// back the pre-scatter horizontal aim angle (about +Y).
-function mulberry32(seed: number): number {
-  let state = seed >>> 0;
-  state = (state + 0x6d2b79f5) | 0;
-  let t = Math.imul(state ^ (state >>> 15), 1 | state);
-  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-}
-function scatterAngleRad(l: BallLaunch): number {
-  const magnitude = (BASE_SCATTER * (1 - l.quality)) / BASE_SCATTER;
-  const signedUnit = mulberry32(l.rngSeed) * 2 - 1;
-  return signedUnit * magnitude * (Math.PI / 6);
-}
-// The pre-scatter horizontal unit dir (undo the +Y rotation buildBallLaunch applied).
+// The serve's horizontal unit aim. With no scatter (and f=1 for charge ≤ 1) this
+// is exactly serveHorizontalDir(side, angle) — normalize the horizontal velocity.
 function recoverHorizAim(l: BallLaunch): { x: number; z: number } {
-  const a = -scatterAngleRad(l); // inverse rotation
-  const cos = Math.cos(a);
-  const sin = Math.sin(a);
-  const vx = l.velocity.x;
-  const vz = l.velocity.z;
-  // launch rotateY: x' = x·cos+z·sin, z' = -x·sin+z·cos ; apply with -angle.
-  const x = vx * cos + vz * sin;
-  const z = -vx * sin + vz * cos;
-  const len = Math.hypot(x, z) || 1;
-  return { x: x / len, z: z / len };
+  const len = Math.hypot(l.velocity.x, l.velocity.z) || 1;
+  return { x: l.velocity.x / len, z: l.velocity.z / len };
 }
 
 function testGroundVsJump(): void {
@@ -183,6 +159,7 @@ function testNetFaceRebound(): void {
   const launch: BallLaunch = {
     origin: { x: 0, y: 1.2, z: -1.2 },
     velocity: { x: 0, y: 0.5, z: 9 }, // low + fast => hits the net face (y ~1 at z=0)
+    omega: { x: 0, y: 0, z: 0 },
     arcType: 'spike',
     quality: 1,
     gravity: GRAVITY,
@@ -207,6 +184,7 @@ function testTapeLetServe(): void {
   const launch: BallLaunch = {
     origin: { x: 0, y: 2.5, z: -1 },
     velocity: { x: 0, y: 0, z: 5 },
+    omega: { x: 0, y: 0, z: 0 },
     arcType: 'serve',
     quality: 0.8,
     gravity: GRAVITY,
@@ -234,6 +212,7 @@ function testNetReboundPreservesPreBounceHistory(): void {
   const preLaunch: BallLaunch = {
     origin: { x: 0, y: 1.2, z: -1.2 },
     velocity: { x: 0, y: 0.5, z: 9 }, // low + hard => hits the net FACE at z=0
+    omega: { x: 0, y: 0, z: 0 },
     arcType: 'spike', quality: 1, gravity: GRAVITY, serverTime: T0, rngSeed: 1,
   };
   const contact = firstEvent(preLaunch, 8000);

@@ -6,7 +6,7 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       reporter: ['text', 'html'],
-      include: ['src/quality/**', 'src/ballistics/**', 'src/intent/**', 'src/kinematics/**'],
+      include: ['src/quality/**', 'src/ballistics/**', 'src/intent/**', 'src/kinematics/**', 'src/physics/**'],
     },
   },
 });

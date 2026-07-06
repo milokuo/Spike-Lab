@@ -11,7 +11,7 @@
  * Options:
  *   --url ws://0.0.0.0:2567         Colyseus endpoint; use ws://localhost:2567 if needed.
  *   --players 2|4                   Lobby size. 4 creates a 2v2 room for teammate dig scenarios.
- *   --probe all|matrix|jump-arc|dive|weak-serve|angle Which live probe(s) to run. Default: all.
+ *   --probe all|matrix|jump-arc|dive|weak-serve|angle|curve Which live probe(s) to run. Default: all.
  *   --latency 100                   Run one artificial outbound-delay value.
  *   --latencies 0,50,100,150        Run a delay matrix.
  *   --offset 50                     Run one touch timing offset.
@@ -27,9 +27,11 @@
 import { Client } from 'colyseus.js';
 import {
   ballPosition,
+  firstEvent,
   CH,
   distXZ,
   gradeOf,
+  GRAVITY,
   DIG_REACH_MAX,
   DIG_VERTICAL_MAX,
   DIVE_REACH_MAX,
@@ -39,6 +41,9 @@ import {
   PERFECT_WINDOW_MS,
   REACH_MAX,
   ROOM_NAME,
+  SERVE_SIDESPIN_MAX,
+  SERVE_SWEEP_PERIOD_MS,
+  SPIN_MAX,
   TICK_MS,
   forwardZ,
   startJump,
@@ -57,6 +62,7 @@ import {
   type TouchIntent,
   type TouchMode,
   type TouchResult,
+  type TrajectoryEvent,
   type Vec3,
 } from '../../../packages/shared/src/index';
 
@@ -67,7 +73,7 @@ declare const process: {
 
 type MessageHandler<T> = (message: T) => void;
 type PlayerCount = 2 | 4;
-type ProbeMode = 'all' | 'matrix' | 'jump-arc' | 'dive' | 'weak-serve' | 'angle';
+type ProbeMode = 'all' | 'matrix' | 'jump-arc' | 'dive' | 'weak-serve' | 'angle' | 'curve';
 
 interface RoomLike {
   roomId: string;
@@ -173,6 +179,51 @@ const SERVE_IN_PLAY_CHARGE = 0.7;
 const WEAK_SERVE_CHARGE = 0.05;
 const SERVE_ANGLE_TOLERANCE_DEG = 6;
 
+// ---- curve probe (M3.0a §8.8) -------------------------------------------------
+// Off-center serve release angle for the DUAL-END CONSISTENCY case (the ball flies
+// untouched to its landing): sweepAngleDeg > 0 ⇒ serveSpin picks side-L (world
+// ω = +Y·rate), a sidespin whose Magnus bends the flight laterally. 30° carries a
+// clearly non-zero |ω| = (30/90)·SERVE_SIDESPIN_MAX ≈ 6.7 rad/s; whether it lands
+// in or out is irrelevant (DeathEvent carries the landing either way).
+const CURVE_SERVE_ANGLE_DEG = 30;
+// Off-center angle for the LAG-COMP scenarios: the receiver must still be able to
+// chase a reachable in-bounds contact on its half. Live calibration: a 15° target
+// (+ the ~2° setTimeout release lateness) curves the descending band past the
+// |x| < 4.2 contact window on some runs; 10° (|ω| ≈ 2.2–2.7 measured) bends the
+// flight ~0.5m yet always leaves a chaseable contact.
+const CURVE_LAGCOMP_ANGLE_DEG = 10;
+// Curved lag-comp serve must carry at least this |ω| (nominal 2.2 at 10°); the
+// straight baseline may carry up to this residual |ω| from release-timing jitter
+// on the sweep center (~1° ⇒ 0.22 rad/s; observed 0.1–0.2, so 0.6 ≈ ±2.7° slack).
+const CURVE_LAGCOMP_MIN_OMEGA = 1.5;
+const CURVE_STRAIGHT_MAX_OMEGA = 0.6;
+// Rally spike charge for the topspin case: nominal ω = SPIN_MAX·charge (world axis
+// ⟂ the hit direction, horizontal), Magnus presses the ball DOWN; fidelity shrinks
+// it by f^SPIN_FIDELITY_EXP for an imperfectly timed touch.
+const CURVE_SPIKE_CHARGE = 0.7;
+// Dual-end position agreement: the bot re-derives every server-computed position
+// (net-rebound chain origins, touch rewind origins, DeathEvent.landing) from the
+// SAME wire BallLaunch via the shared flight API. Identical code + identical inputs
+// ⇒ ~ulp agreement in a faithful pipeline; 5cm is a generous envelope (ring-buffer
+// interp ≈ mm, net anti-jitter nudge ≈ mm) that still catches any true Magnus
+// divergence (which on a curved flight is meters, not cm).
+const CURVE_POS_TOLERANCE = 0.05;
+// Materiality floor: how far Magnus must have shifted the landing vs a spin-free
+// (ω=0) twin of the same launch. Guards the consistency check from passing
+// trivially on a straight ball (a degenerate ω≈0 launch sneaking through).
+const CURVE_MIN_LANDING_SHIFT = 0.15;
+// Release-timing slack when checking the serve's |ω| against the targeted sweep
+// angle: the sweep moves 0.225°/ms, so ±10° absorbs scheduling + clock-offset
+// jitter (the angle probe's own pass tolerance is 6°).
+const CURVE_ANGLE_SLACK_DEG = 10;
+// Spike |ω| floor: nominal 31.5 (SPIN_MAX·0.7); even a sloppily timed accepted
+// touch (f ≈ 0.3, ω·f^1.5) stays above 5. Lower means spin never hit the wire.
+const CURVE_SPIKE_MIN_OMEGA = 5;
+const CURVE_HORIZON_MS = MAX_TRAJECTORY_MS;
+// Lag-comp-no-skew sweep: ideal-moment (offset 0) touches under these outbound
+// delays, curved serve vs straight (angle-0, zero-sidespin) baseline.
+const CURVE_LAGCOMP_LATENCIES = [0, 100, 150];
+
 function nowMs(): number {
   return performance.now();
 }
@@ -205,11 +256,12 @@ function parseProbe(value: string): ProbeMode {
     value === 'jump-arc' ||
     value === 'dive' ||
     value === 'weak-serve' ||
-    value === 'angle'
+    value === 'angle' ||
+    value === 'curve'
   ) {
     return value;
   }
-  throw new Error('--probe must be all, matrix, jump-arc, dive, weak-serve, or angle.');
+  throw new Error('--probe must be all, matrix, jump-arc, dive, weak-serve, angle, or curve.');
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -464,6 +516,9 @@ function makeInputFrame(seq: number, jumpHeld: boolean, touchMode: TouchMode = '
     move: { x: 0 as Axis, y: 0 as Axis },
     jumpHeld,
     touchMode,
+    // M2.8 wire added isCharging; a resting/idle bot never holds the charge
+    // button, so it reports false every frame (server writes authoritative state).
+    isCharging: false,
     dtMs: TICK_MS,
     yaw: null,
   };
@@ -1055,6 +1110,8 @@ async function moveToward(
       move: { x: mx, y: my },
       jumpHeld: false,
       touchMode: 'dig',
+      // M2.8 wire field: a pure movement frame isn't charging.
+      isCharging: false,
       dtMs: 33,
       yaw: null,
     } satisfies InputFrame);
@@ -1070,6 +1127,142 @@ function nextSweepCenterServerTime(phaseStart: number, afterServerTime: number):
   const base = phaseStart + 400;
   const k = Math.max(0, Math.ceil((afterServerTime + 40 - base) / 800));
   return base + 800 * k;
+}
+
+// Next FUTURE serverTime whose sweep angle == targetAngleDeg on the RISING edge
+// (phase ∈ [0,0.5): angle = -90 + 360·phase ⇒ phase = (angle+90)/360). A positive
+// target gives a deterministic off-center serve carrying sidespin (serveSpin picks
+// side-L for angle ≥ 0). Occurrences recur once per full SERVE_SWEEP_PERIOD_MS.
+function nextSweepAngleServerTime(phaseStart: number, afterServerTime: number, targetAngleDeg: number): number {
+  const phase = (targetAngleDeg + 90) / 360; // rising-edge phase for this angle
+  const elapsedInCycle = phase * SERVE_SWEEP_PERIOD_MS;
+  const base = phaseStart + elapsedInCycle;
+  const k = Math.max(0, Math.ceil((afterServerTime + 40 - base) / SERVE_SWEEP_PERIOD_MS));
+  return base + SERVE_SWEEP_PERIOD_MS * k;
+}
+
+function vmag(v: Vec3): number {
+  return Math.hypot(v.x, v.y, v.z);
+}
+
+function dist3(a: Vec3, b: Vec3): number {
+  return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+interface CurveSubCheck {
+  pass: boolean;
+  detail: string;
+}
+
+// Expected serve sidespin magnitude band for a release targeted at `angleDeg`:
+// |ω| = (|angle|/90)·SERVE_SIDESPIN_MAX with ±CURVE_ANGLE_SLACK_DEG release jitter.
+function serveSpinBand(angleDeg: number): { min: number; max: number } {
+  const lo = Math.max(0, Math.abs(angleDeg) - CURVE_ANGLE_SLACK_DEG);
+  const hi = Math.abs(angleDeg) + CURVE_ANGLE_SLACK_DEG;
+  return { min: (lo / 90) * SERVE_SIDESPIN_MAX, max: (hi / 90) * SERVE_SIDESPIN_MAX };
+}
+
+interface SpinSpec {
+  minMag: number;
+  maxMag: number;
+  // sidespin ⇒ ω ∥ ±Y (spinIntentToWorld side-L/R axis = ±UP);
+  // topspin ⇒ ω ⟂ Y (axis = up × forward, horizontal). Fidelity only SCALES ω,
+  // so the axis orientation is an exact wire invariant, not an approximation.
+  axis: 'vertical' | 'horizontal';
+  requirePositiveY?: boolean; // side-L (+angle release) ⇒ ω = +Y·rate exactly
+}
+
+// Assert a wire launch carries the spin signature the shared presets promise.
+function assertSpinSignature(label: string, launch: BallLaunch, spec: SpinSpec): CurveSubCheck {
+  const mag = vmag(launch.omega);
+  if (mag < spec.minMag || mag > spec.maxMag) {
+    return {
+      pass: false,
+      detail: `${label}: |ω|=${mag.toFixed(2)}rad/s outside [${spec.minMag.toFixed(2)}, ${spec.maxMag.toFixed(2)}]`,
+    };
+  }
+  const yFraction = Math.abs(launch.omega.y) / (mag || 1);
+  if (spec.axis === 'vertical' && yFraction < 0.95) {
+    return { pass: false, detail: `${label}: sidespin ω not vertical (|ωy|/|ω|=${yFraction.toFixed(3)})` };
+  }
+  if (spec.axis === 'horizontal' && yFraction > 0.05) {
+    return { pass: false, detail: `${label}: topspin ω not horizontal (|ωy|/|ω|=${yFraction.toFixed(3)})` };
+  }
+  if (spec.requirePositiveY && launch.omega.y <= 0) {
+    return { pass: false, detail: `${label}: +angle serve must carry ω = +Y (side-L), got ωy=${launch.omega.y.toFixed(2)}` };
+  }
+  return { pass: true, detail: `${label}: |ω|=${mag.toFixed(2)}rad/s axis=${spec.axis} ok` };
+}
+
+// How far Magnus displaced this launch's landing vs a spin-free (ω = 0) twin —
+// the trajectory's "did it actually curve" materiality measure. A fresh object
+// simply gets its own flight-cache entry; determinism is cache-independent.
+function magnusShiftOf(launch: BallLaunch): number {
+  const curved: TrajectoryEvent = firstEvent(launch, CURVE_HORIZON_MS);
+  const straightTwin: BallLaunch = { ...launch, omega: { x: 0, y: 0, z: 0 } };
+  const straight = firstEvent(straightTwin, CURVE_HORIZON_MS);
+  return dist3(curved.pos, straight.pos);
+}
+
+// DUAL-END CONSISTENCY over a whole rally chain: every server-computed position on
+// the wire must equal the bot's local shared-flight rederivation of the SAME data.
+//   link i  : ballPosition(launch[i-1], launch[i].serverTime − launch[i-1].serverTime)
+//             vs launch[i].origin — a net-rebound contact origin (server bisection)
+//             or a touch-return origin (server ring-buffer rewind), both of which
+//             must sit ON the previous launch's pure trajectory.
+//   landing : local firstEvent(final launch) vs DeathEvent.landing (+ cause kind).
+// Any drift beyond CURVE_POS_TOLERANCE = the two ends disagree about where the
+// curved ball IS — an engine-level P1 bug, reported with numbers.
+function assertChainConsistency(
+  label: string,
+  launches: BallLaunch[],
+  deathLanding: Vec3,
+  deathCause: DeathEvent['cause'],
+): CurveSubCheck {
+  const finalLaunch = launches[launches.length - 1];
+  if (!finalLaunch) {
+    return { pass: false, detail: `${label}: no launches observed` };
+  }
+
+  let worstLinkCm = 0;
+  for (let i = 1; i < launches.length; i += 1) {
+    const prev = launches[i - 1]!;
+    const next = launches[i]!;
+    const predicted = ballPosition(prev, next.serverTime - prev.serverTime);
+    const errCm = dist3(predicted, next.origin) * 100;
+    worstLinkCm = Math.max(worstLinkCm, errCm);
+    if (errCm > CURVE_POS_TOLERANCE * 100) {
+      return {
+        pass: false,
+        detail:
+          `${label}: chain link ${i} (${next.isNetTouch ? 'net-rebound' : 'touch'} origin) drifted ` +
+          `${errCm.toFixed(2)}cm > ${(CURVE_POS_TOLERANCE * 100).toFixed(0)}cm — dual-end divergence at ` +
+          `t=${(next.serverTime - prev.serverTime).toFixed(1)}ms after launch`,
+      };
+    }
+  }
+
+  const ev: TrajectoryEvent = firstEvent(finalLaunch, CURVE_HORIZON_MS);
+  if (ev.kind !== 'ground' && ev.kind !== 'out') {
+    return { pass: false, detail: `${label}: local firstEvent predicted '${ev.kind}', server saw a '${deathCause}' landing` };
+  }
+  const landErrCm = dist3(ev.pos, deathLanding) * 100;
+  if (landErrCm > CURVE_POS_TOLERANCE * 100) {
+    return {
+      pass: false,
+      detail:
+        `${label}: landing drifted ${landErrCm.toFixed(2)}cm > ${(CURVE_POS_TOLERANCE * 100).toFixed(0)}cm ` +
+        `(local=${ev.pos.x.toFixed(3)},${ev.pos.y.toFixed(3)},${ev.pos.z.toFixed(3)} ` +
+        `server=${deathLanding.x.toFixed(3)},${deathLanding.y.toFixed(3)},${deathLanding.z.toFixed(3)}) — dual-end divergence`,
+    };
+  }
+  if (ev.kind !== deathCause) {
+    return { pass: false, detail: `${label}: local event kind '${ev.kind}' ≠ server death cause '${deathCause}'` };
+  }
+  return {
+    pass: true,
+    detail: `${label}: links=${launches.length - 1} worstLink=${worstLinkCm.toFixed(2)}cm landingErr=${landErrCm.toFixed(2)}cm cause=${deathCause}`,
+  };
 }
 
 async function runDiveProbe(url: string, players: PlayerCount, samples: number, timeoutMs: number): Promise<DiveProbeResult> {
@@ -1117,8 +1310,15 @@ async function runDiveProbe(url: string, players: PlayerCount, samples: number, 
     }
     const servingSync = syncs[rooms.indexOf(servingRoom)]!;
     const diverSync = syncs[rooms.indexOf(diverRoom)]!;
+    // TouchResult is broadcast to the WHOLE room for EVERY touch (M2.8) — the
+    // serve itself emits one (playerId = server). Arm the capture only once the
+    // dive touch is actually sent and filter to the diver's own result, or the
+    // stale serve result satisfies the wait and reads as "no dive outcome".
+    let awaitingDiveResult = false;
     diverRoom.onMessage<TouchResult>(CH.TOUCH_RESULT, (message) => {
-      result = message;
+      if (awaitingDiveResult && message.playerId === diverRoom.sessionId) {
+        result = result ?? message;
+      }
     });
 
     let serverSeq = 1;
@@ -1143,14 +1343,29 @@ async function runDiveProbe(url: string, players: PlayerCount, samples: number, 
     }
     const diverSide = diver0.side;
 
-    // Chase to ~DIVE_TARGET_DISTANCE from the reachable contact point so the ball
-    // passes through the dive annulus (DIG_REACH_MAX, DIVE_REACH_MAX] — close
-    // enough to trigger a dive, far enough not to be a plain dig. Read pendingLaunch
-    // fresh (not a snapshot taken once) since a net contact before this point would
-    // have already superseded it with the post-bounce continuation (§1).
+    // Stand ~DIVE_TARGET_DISTANCE away from the reachable contact point so the
+    // ball descends through the dive annulus (DIG_REACH_MAX, DIVE_REACH_MAX] —
+    // close enough to trigger a dive, far enough not to be a plain dig. This is
+    // an explicit stand point (contact + 2.8u offset away from the spawn side,
+    // clamped in-bounds), NOT "chase toward contact and stop at 2.8": the M3.0a
+    // drag-era serve is short enough that the diver's SPAWN can already be
+    // INSIDE 2.8u of the contact (measured 1.58u), which parked the old chase in
+    // plain-dig range and starved estimateDiveTouchServerTime of annulus points.
+    // Read pendingLaunch fresh (not a snapshot taken once) since a net contact
+    // before this point would have superseded it with the continuation (§1).
     const contact = reachableContact(pendingLaunch!, diverSide);
     let chased = false;
     if (contact) {
+      const awayX = diver0.pos.x - contact.pos.x;
+      const awayZ = diver0.pos.z - contact.pos.z;
+      const awayLen = Math.hypot(awayX, awayZ);
+      const deeperZ = diverSide === 'A' ? -1 : 1; // fallback: deeper on own half
+      const ux = awayLen > 0.25 ? awayX / awayLen : 0;
+      const uz = awayLen > 0.25 ? awayZ / awayLen : deeperZ;
+      const standX = Math.max(-4.2, Math.min(4.2, contact.pos.x + ux * DIVE_TARGET_DISTANCE));
+      const standZRaw = contact.pos.z + uz * DIVE_TARGET_DISTANCE;
+      const standZ =
+        diverSide === 'A' ? Math.max(-8.5, Math.min(-0.3, standZRaw)) : Math.max(0.3, Math.min(8.5, standZRaw));
       const contactClientTime = clientTimeForServerMappedTime(diverSync, contact.serverTime);
       const moveBudget = Math.max(200, Math.min(1600, contactClientTime - nowMs() - 200));
       diverSeq = await moveToward(
@@ -1158,11 +1373,11 @@ async function runDiveProbe(url: string, players: PlayerCount, samples: number, 
         diverRoom.sessionId,
         diverSide,
         () => latestSnapshot,
-        contact.pos.x,
-        contact.pos.z,
+        standX,
+        standZ,
         diverSeq,
         moveBudget,
-        DIVE_TARGET_DISTANCE,
+        0.4,
       );
       chased = true;
     }
@@ -1187,6 +1402,7 @@ async function runDiveProbe(url: string, players: PlayerCount, samples: number, 
       diverSeq += 1;
       void diverSeq;
       resultSeen = true;
+      awaitingDiveResult = true;
       diverRoom.send(CH.TOUCH, makeTouchIntent(diverRoom.sessionId, clientTime, 'dig', 0));
     }
 
@@ -1453,6 +1669,524 @@ function printAngleResult(result: AngleProbeResult): void {
   console.log(`angle players=${result.players} status=${result.pass ? 'PASS' : 'FAIL'} detail=${result.detail}`);
 }
 
+/* ---- curve probe (M3.0a §8.8): spinning-launch dual-end consistency +
+   curved-ball lag-comp no-skew ------------------------------------------- */
+
+interface CurveProbeResult {
+  players: PlayerCount;
+  pass: boolean;
+  detail: string;
+}
+
+interface CurveLagCompRun {
+  latencyMs: number;
+  angleDeg: number;
+  expected: TouchGrade;
+  actual: TouchGrade | 'NO_RESULT' | 'ERROR';
+  accepted: boolean;
+  serveOmegaMag: number;
+  detail: string;
+}
+
+// Release the serve at a targeted sweep angle (0 = the deterministic center the
+// other probes use; non-zero = the off-center release that carries sidespin).
+async function releaseServeAtSweepAngle(
+  servingRoom: RoomLike,
+  servingSync: ClockSync,
+  phaseStart: number,
+  angleDeg: number,
+  seq: number,
+): Promise<number> {
+  sendModeInput(servingRoom, seq, 'spike');
+  const nowServer = serverMappedClientTime(servingSync, nowMs());
+  const targetServerTime =
+    angleDeg === 0
+      ? nextSweepCenterServerTime(phaseStart, nowServer)
+      : nextSweepAngleServerTime(phaseStart, nowServer, angleDeg);
+  await sleep(Math.max(0, clientTimeForServerMappedTime(servingSync, targetServerTime) - nowMs()));
+  servingRoom.send(CH.TOUCH, makeTouchIntent(servingRoom.sessionId, nowMs(), 'spike', SERVE_IN_PLAY_CHARGE));
+  return seq + 1;
+}
+
+// Consistency case 1 — SIDESPIN SERVE: release at +30°, let the ball fly UNTOUCHED
+// to its landing, then assert (a) the wire launch carries the promised sidespin
+// signature, (b) the trajectory materially curved (Magnus shift vs a spin-free
+// twin), and (c) the server's chain/landing positions equal the bot's local
+// shared-flight rederivation.
+async function runCurveServeCase(
+  url: string,
+  players: PlayerCount,
+  samples: number,
+  timeoutMs: number,
+): Promise<CurveSubCheck> {
+  let session: LobbySession | undefined;
+
+  try {
+    session = await createLobby(url, players, timeoutMs);
+    const rooms = session.rooms;
+    let latestSnapshot: StateSnapshot | undefined;
+    const launches: BallLaunch[] = [];
+    let death: DeathEvent | undefined;
+
+    const host = session.host;
+    host.onMessage<StateSnapshot>(CH.SNAPSHOT, (snapshot) => {
+      latestSnapshot = snapshot;
+    });
+    host.onMessage<BallLaunch>(CH.BALL_LAUNCH, (launch) => {
+      launches.push(launch);
+    });
+    host.onMessage<DeathEvent>(CH.DEATH, (message) => {
+      death = death ?? message;
+    });
+    host.onMessage<TouchResult>(CH.TOUCH_RESULT, () => undefined);
+    muteSnapshotsForIdleRooms(session, [host]);
+
+    const syncs = await Promise.all(rooms.map((room) => startClockSync(room, samples)));
+    await startLobbyMatch(session, timeoutMs, () => latestSnapshot?.phase === 'serve');
+    await waitUntil(
+      () => latestSnapshot?.servingId != null && latestSnapshot?.servePhaseStartServerTime != null,
+      50,
+      timeoutMs,
+      'curve serve setup',
+    );
+
+    const servingId = latestSnapshot!.servingId!;
+    const servingIndex = rooms.findIndex((room) => room.sessionId === servingId);
+    const servingRoom = servingIndex >= 0 ? rooms[servingIndex] : undefined;
+    const servingSync = servingIndex >= 0 ? syncs[servingIndex] : undefined;
+    if (!servingRoom || !servingSync) {
+      throw new Error('could not identify curve-probe serving room');
+    }
+
+    await releaseServeAtSweepAngle(
+      servingRoom,
+      servingSync,
+      latestSnapshot!.servePhaseStartServerTime!,
+      CURVE_SERVE_ANGLE_DEG,
+      1,
+    );
+    await withTimeout(
+      waitUntil(() => death !== undefined, 50, timeoutMs, 'curve serve death'),
+      timeoutMs + 100,
+      'curve serve case',
+    );
+
+    const serveLaunch = launches.find((launch) => launch.arcType === 'serve' && !launch.isNetTouch);
+    if (!serveLaunch) {
+      return { pass: false, detail: 'serve-consistency: no serve BallLaunch observed' };
+    }
+
+    const band = serveSpinBand(CURVE_SERVE_ANGLE_DEG);
+    const spin = assertSpinSignature('serve sidespin', serveLaunch, {
+      minMag: band.min,
+      maxMag: band.max,
+      axis: 'vertical',
+      requirePositiveY: true,
+    });
+    if (!spin.pass) return spin;
+
+    const shiftCm = magnusShiftOf(serveLaunch) * 100;
+    if (shiftCm < CURVE_MIN_LANDING_SHIFT * 100) {
+      return {
+        pass: false,
+        detail: `serve-consistency: Magnus landing shift ${shiftCm.toFixed(1)}cm < ${(CURVE_MIN_LANDING_SHIFT * 100).toFixed(0)}cm — ball did not actually curve`,
+      };
+    }
+
+    const chain = assertChainConsistency('serve-consistency', launches, death!.landing, death!.cause);
+    if (!chain.pass) return chain;
+    return { pass: true, detail: `${spin.detail}; magnusShift=${shiftCm.toFixed(0)}cm; ${chain.detail}` };
+  } catch (error) {
+    return { pass: false, detail: `serve-consistency: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    if (session) {
+      await closeRooms(session.rooms);
+    }
+  }
+}
+
+// Consistency case 2 — TOPSPIN SPIKE: straight serve to the receiver, who chases
+// and returns it with a charged SPIKE at the ideal moment; the spike launch must
+// carry horizontal topspin, materially curve (Magnus presses it down), and the
+// whole chain (serve → spike origin → landing) must rederive locally.
+async function runCurveSpikeCase(
+  url: string,
+  players: PlayerCount,
+  samples: number,
+  timeoutMs: number,
+): Promise<CurveSubCheck> {
+  let session: LobbySession | undefined;
+
+  try {
+    session = await createLobby(url, players, timeoutMs);
+    const serverRoom = requireRoom(session, 0, 'server');
+    const testedRoom = requireRoom(session, 1, 'spiker');
+    muteSnapshotsForIdleRooms(session, [serverRoom, testedRoom]);
+
+    let latestSnapshot: StateSnapshot | undefined;
+    const launches: BallLaunch[] = [];
+    let result: TouchResult | undefined;
+    let awaitingSpikeResult = false;
+    let death: DeathEvent | undefined;
+    let testedSeq = 1;
+
+    testedRoom.onMessage<StateSnapshot>(CH.SNAPSHOT, (snapshot) => {
+      latestSnapshot = snapshot;
+    });
+    testedRoom.onMessage<BallLaunch>(CH.BALL_LAUNCH, (launch) => {
+      launches.push(launch);
+    });
+    testedRoom.onMessage<TouchResult>(CH.TOUCH_RESULT, (message) => {
+      if (awaitingSpikeResult && message.playerId === testedRoom.sessionId) {
+        result = result ?? message;
+      }
+    });
+    testedRoom.onMessage<DeathEvent>(CH.DEATH, (message) => {
+      death = death ?? message;
+    });
+    serverRoom.onMessage<StateSnapshot>(CH.SNAPSHOT, () => undefined);
+    serverRoom.onMessage<BallLaunch>(CH.BALL_LAUNCH, () => undefined);
+    serverRoom.onMessage<TouchResult>(CH.TOUCH_RESULT, () => undefined);
+    serverRoom.onMessage(CH.DEATH, () => undefined);
+
+    const [serverSync, testedSync] = await Promise.all([
+      startClockSync(serverRoom, samples),
+      startClockSync(testedRoom, samples),
+    ]);
+
+    await startLobbyMatch(session, timeoutMs, () => latestSnapshot?.phase === 'serve');
+    await waitUntil(
+      () => latestSnapshot?.servingId != null && latestSnapshot?.servePhaseStartServerTime != null,
+      50,
+      timeoutMs,
+      'curve spike serve setup',
+    );
+    if (latestSnapshot?.servingId !== serverRoom.sessionId) {
+      throw new Error(`expected rooms[0] to serve (got servingId=${latestSnapshot?.servingId})`);
+    }
+
+    // Straight serve (sweep center) so the chase is deterministic; the CURVE in
+    // this case comes from the receiver's topspin spike return.
+    await releaseServeAtSweepAngle(serverRoom, serverSync, latestSnapshot.servePhaseStartServerTime!, 0, 1);
+    const latestServeLaunch = (): BallLaunch | undefined => {
+      for (let i = launches.length - 1; i >= 0; i -= 1) {
+        if (launches[i]!.arcType === 'serve') return launches[i];
+      }
+      return undefined;
+    };
+    await withTimeout(
+      waitUntil(() => latestServeLaunch() !== undefined, 50, timeoutMs, 'curve spike serve launch'),
+      timeoutMs + 100,
+      'curve spike launch',
+    );
+
+    const receiver0 = latestPlayer(latestSnapshot, testedRoom.sessionId);
+    if (!receiver0) {
+      throw new Error('spiker snapshot missing before chase');
+    }
+    const receiverSide = receiver0.side;
+
+    const contact = reachableContact(latestServeLaunch()!, receiverSide);
+    if (contact) {
+      const contactClientTime = clientTimeForServerMappedTime(testedSync, contact.serverTime);
+      const moveBudget = Math.max(200, Math.min(1600, contactClientTime - nowMs() - 200));
+      testedSeq = await moveToward(
+        testedRoom,
+        testedRoom.sessionId,
+        receiverSide,
+        () => latestSnapshot,
+        contact.pos.x,
+        contact.pos.z,
+        testedSeq,
+        moveBudget,
+        0.5,
+      );
+    }
+
+    // Switch the authoritative mode to spike NOW (≥200ms before the touch, per the
+    // chase budget's reserve) so the server has consumed the INPUT frame by then.
+    sendModeInput(testedRoom, testedSeq, 'spike');
+    testedSeq += 1;
+    void testedSeq;
+
+    const receiverNow = latestPlayer(latestSnapshot, testedRoom.sessionId);
+    if (!receiverNow) {
+      throw new Error('spiker snapshot missing after chase');
+    }
+    const idealServerTime = estimateIdealTouchServerTime(latestServeLaunch()!, receiverNow.pos);
+    if (idealServerTime === null) {
+      return { pass: false, detail: 'spike-consistency: no reachable contact point on the served trajectory' };
+    }
+    const planned = planTouch(idealServerTime, 0, testedSync);
+    await sleep(Math.max(0, planned.clientTime - nowMs()));
+
+    awaitingSpikeResult = true;
+    testedRoom.send(CH.TOUCH, makeTouchIntent(testedRoom.sessionId, planned.clientTime, 'spike', CURVE_SPIKE_CHARGE));
+
+    await withTimeout(
+      waitUntil(() => result !== undefined, 50, timeoutMs, 'curve spike touch result'),
+      timeoutMs + 100,
+      'curve spike result',
+    );
+    if (result?.accepted !== true) {
+      return {
+        pass: false,
+        detail: `spike-consistency: spike touch not accepted (grade=${result?.grade} outcome=${String(result?.outcome)})`,
+      };
+    }
+    await withTimeout(
+      waitUntil(() => death !== undefined, 50, timeoutMs, 'curve spike death'),
+      timeoutMs + 100,
+      'curve spike death',
+    );
+
+    const spikeLaunch = launches.find((launch) => launch.arcType === 'spike' && !launch.isNetTouch);
+    if (!spikeLaunch) {
+      return { pass: false, detail: 'spike-consistency: no spike BallLaunch observed after accepted spike touch' };
+    }
+
+    const spin = assertSpinSignature('spike topspin', spikeLaunch, {
+      minMag: CURVE_SPIKE_MIN_OMEGA,
+      maxMag: SPIN_MAX + 0.1,
+      axis: 'horizontal',
+    });
+    if (!spin.pass) return spin;
+
+    const shiftCm = magnusShiftOf(spikeLaunch) * 100;
+    if (shiftCm < CURVE_MIN_LANDING_SHIFT * 100) {
+      return {
+        pass: false,
+        detail: `spike-consistency: Magnus landing shift ${shiftCm.toFixed(1)}cm < ${(CURVE_MIN_LANDING_SHIFT * 100).toFixed(0)}cm — spike did not actually curve`,
+      };
+    }
+
+    const chain = assertChainConsistency('spike-consistency', launches, death!.landing, death!.cause);
+    if (!chain.pass) return chain;
+    return {
+      pass: true,
+      detail: `${spin.detail} (grade=${result.grade}); magnusShift=${shiftCm.toFixed(0)}cm; ${chain.detail}`,
+    };
+  } catch (error) {
+    return { pass: false, detail: `spike-consistency: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    if (session) {
+      await closeRooms(session.rooms);
+    }
+  }
+}
+
+// One lag-comp run: serve at `angleDeg` (0 = straight baseline), receiver under
+// `latencyMs` simulated outbound delay chases and digs at the IDEAL moment
+// (offset 0). Mirrors the matrix scenario except for the parameterized release
+// angle + captured serve |ω|. Deliberately a separate function: the matrix probe
+// is a shipped gate and stays byte-identical.
+async function runCurveLagCompScenario(
+  url: string,
+  players: PlayerCount,
+  angleDeg: number,
+  latencyMs: number,
+  samples: number,
+  timeoutMs: number,
+): Promise<CurveLagCompRun> {
+  let session: LobbySession | undefined;
+  let expected: TouchGrade = gradeOf(0);
+  let serveOmegaMag = Number.NaN;
+
+  try {
+    session = await createLobby(url, players, timeoutMs);
+    const serverRoom = requireRoom(session, 0, 'server');
+    const testedRoom = requireRoom(session, 1, 'tested receiver');
+    muteSnapshotsForIdleRooms(session, [serverRoom, testedRoom]);
+    const outbound = wrapOutboundLatency(testedRoom, latencyMs);
+
+    let latestSnapshot: StateSnapshot | undefined;
+    let pendingLaunch: BallLaunch | undefined;
+    let result: TouchResult | undefined;
+    let awaitingRallyTouchResult = false;
+    let testedSeq = 1;
+
+    testedRoom.onMessage<StateSnapshot>(CH.SNAPSHOT, (snapshot) => {
+      latestSnapshot = snapshot;
+    });
+    testedRoom.onMessage<TouchResult>(CH.TOUCH_RESULT, (message) => {
+      if (!awaitingRallyTouchResult) return;
+      result = result ?? message;
+    });
+    testedRoom.onMessage<BallLaunch>(CH.BALL_LAUNCH, (launch) => {
+      // Track the latest serve-arc launch (a net contact chains a continuation —
+      // same rule as the matrix/dive probes) and remember the ORIGINAL launch's
+      // |ω| for the curved-vs-straight bookkeeping.
+      if (launch.arcType === 'serve') {
+        if (!launch.isNetTouch && !Number.isFinite(serveOmegaMag)) {
+          serveOmegaMag = vmag(launch.omega);
+        }
+        pendingLaunch = launch;
+      }
+    });
+    testedRoom.onMessage(CH.DEATH, () => undefined);
+    serverRoom.onMessage<StateSnapshot>(CH.SNAPSHOT, () => undefined);
+    serverRoom.onMessage<BallLaunch>(CH.BALL_LAUNCH, () => undefined);
+    serverRoom.onMessage<TouchResult>(CH.TOUCH_RESULT, () => undefined);
+    serverRoom.onMessage(CH.DEATH, () => undefined);
+
+    const [serverSync, testedSync] = await Promise.all([
+      startClockSync(serverRoom, samples),
+      startClockSync(testedRoom, samples),
+    ]);
+
+    await startLobbyMatch(session, timeoutMs, () => latestSnapshot?.phase === 'serve');
+    await waitUntil(
+      () => latestSnapshot?.servingId != null && latestSnapshot?.servePhaseStartServerTime != null,
+      50,
+      timeoutMs,
+      'curve lag-comp serve setup',
+    );
+    if (latestSnapshot?.servingId !== serverRoom.sessionId) {
+      throw new Error(`expected rooms[0] to serve (got servingId=${latestSnapshot?.servingId})`);
+    }
+
+    await releaseServeAtSweepAngle(serverRoom, serverSync, latestSnapshot.servePhaseStartServerTime!, angleDeg, 1);
+    await withTimeout(
+      waitUntil(() => pendingLaunch !== undefined, 50, timeoutMs, 'curve lag-comp serve launch'),
+      timeoutMs + 100,
+      'curve lag-comp launch',
+    );
+
+    const receiver0 = latestPlayer(latestSnapshot, testedRoom.sessionId);
+    if (!receiver0) {
+      throw new Error('tested receiver snapshot missing before chase');
+    }
+    const receiverSide = receiver0.side;
+
+    // Chase with the delay dropped (movement is not what is graded — matrix rule),
+    // restore it right before the graded ideal-moment touch.
+    outbound.setDelayMs(0);
+    const contact = reachableContact(pendingLaunch!, receiverSide);
+    let chased = false;
+    if (contact) {
+      const contactClientTime = clientTimeForServerMappedTime(testedSync, contact.serverTime);
+      const moveBudget = Math.max(200, Math.min(1600, contactClientTime - nowMs() - 200));
+      testedSeq = await moveToward(
+        testedRoom,
+        testedRoom.sessionId,
+        receiverSide,
+        () => latestSnapshot,
+        contact.pos.x,
+        contact.pos.z,
+        testedSeq,
+        moveBudget,
+        0.5,
+      );
+      chased = true;
+    }
+    outbound.setDelayMs(latencyMs);
+
+    const receiverNow = latestPlayer(latestSnapshot, testedRoom.sessionId);
+    if (!receiverNow) {
+      throw new Error('tested receiver snapshot missing after chase');
+    }
+    const idealServerTime = estimateIdealTouchServerTime(pendingLaunch!, receiverNow.pos);
+    if (idealServerTime === null) {
+      return {
+        latencyMs,
+        angleDeg,
+        expected,
+        actual: 'NO_RESULT',
+        accepted: false,
+        serveOmegaMag,
+        detail: `no reachable contact point (chased=${chased ? 'yes' : 'no'})`,
+      };
+    }
+
+    const planned = planTouch(idealServerTime, 0, testedSync);
+    expected = planned.expectedGrade;
+    await sleep(Math.max(0, planned.clientTime - nowMs()));
+
+    awaitingRallyTouchResult = true;
+    sendModeInput(testedRoom, testedSeq, 'dig');
+    testedSeq += 1;
+    testedRoom.send(CH.TOUCH, makeTouchIntent(testedRoom.sessionId, planned.clientTime));
+
+    await withTimeout(
+      waitUntil(() => result !== undefined, 50, timeoutMs, 'curve lag-comp touch result'),
+      timeoutMs + 100,
+      'curve lag-comp scenario',
+    );
+
+    return {
+      latencyMs,
+      angleDeg,
+      expected,
+      actual: result?.grade ?? 'NO_RESULT',
+      accepted: result?.accepted === true,
+      serveOmegaMag,
+      detail: `effectiveDelta=${planned.effectiveDeltaMs.toFixed(1)}ms rtt=${testedSync.rttMs.toFixed(1)}ms chased=${chased ? 'yes' : 'no'}`,
+    };
+  } catch (error) {
+    return {
+      latencyMs,
+      angleDeg,
+      expected,
+      actual: 'ERROR',
+      accepted: false,
+      serveOmegaMag,
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    if (session) {
+      await closeRooms(session.rooms);
+    }
+  }
+}
+
+async function runCurveProbe(
+  url: string,
+  players: PlayerCount,
+  samples: number,
+  timeoutMs: number,
+): Promise<CurveProbeResult> {
+  const checks: CurveSubCheck[] = [];
+  checks.push(await runCurveServeCase(url, players, samples, timeoutMs));
+  checks.push(await runCurveSpikeCase(url, players, samples, timeoutMs));
+
+  // Lag-comp no-skew: at every latency, an ideal-moment touch on the CURVED serve
+  // must grade exactly like the STRAIGHT baseline (and both must be the planned
+  // PERFECT — the known ~latency/2 skew only afflicts deliberately offset touches,
+  // testing.md §4, so any curvature-correlated deviation here is a real bug).
+  const lagLines: string[] = [];
+  let lagPass = true;
+  for (const latencyMs of CURVE_LAGCOMP_LATENCIES) {
+    const curved = await runCurveLagCompScenario(url, players, CURVE_LAGCOMP_ANGLE_DEG, latencyMs, samples, timeoutMs);
+    const straight = await runCurveLagCompScenario(url, players, 0, latencyMs, samples, timeoutMs);
+    const spinOk =
+      curved.serveOmegaMag >= CURVE_LAGCOMP_MIN_OMEGA &&
+      curved.serveOmegaMag <= serveSpinBand(CURVE_LAGCOMP_ANGLE_DEG).max &&
+      straight.serveOmegaMag <= CURVE_STRAIGHT_MAX_OMEGA;
+    const bothAccepted = curved.accepted && straight.accepted;
+    const noSkew = curved.actual === straight.actual;
+    const bothIdeal = curved.actual === curved.expected && straight.actual === straight.expected;
+    const ok = spinOk && bothAccepted && noSkew && bothIdeal;
+    lagPass = lagPass && ok;
+    lagLines.push(
+      `lat=${latencyMs}ms curved=${curved.actual}(|ω|=${curved.serveOmegaMag.toFixed(1)}) ` +
+        `straight=${straight.actual}(|ω|=${straight.serveOmegaMag.toFixed(1)}) ${ok ? 'ok' : 'FAIL'}` +
+        (ok ? '' : ` [spinOk=${spinOk} accepted=${bothAccepted} noSkew=${noSkew} ideal=${bothIdeal}; curved: ${curved.detail}; straight: ${straight.detail}]`),
+    );
+  }
+  checks.push({ pass: lagPass, detail: `lag-comp ideal-touch no-skew: ${lagLines.join(' | ')}` });
+
+  const pass = checks.every((check) => check.pass);
+  return {
+    players,
+    pass,
+    detail: checks.map((check) => `[${check.pass ? 'ok' : 'FAIL'}] ${check.detail}`).join(' ;; '),
+  };
+}
+
+function printCurveResult(result: CurveProbeResult): void {
+  console.log(`curve players=${result.players} status=${result.pass ? 'PASS' : 'FAIL'} detail=${result.detail}`);
+}
+
 function assertSelf(condition: boolean, message: string): void {
   if (!condition) {
     throw new Error(`self-test failed: ${message}`);
@@ -1540,7 +2274,72 @@ function runSelfTest(): void {
   assertSelf(sideB45.x < -0.5, 'side B +45 serve sweeps toward -X (matches serveHorizontalDir)');
   assertSelf(Math.abs(sweepAngleDeg(0) + 90) < 0.001, 'serve sweep starts at -90 degrees');
 
-  console.log('self-test PASS: clock mapping, jump arc/apex, dive outcome, and serve-angle helpers');
+  // ---- curve probe helpers (no server needed) ----
+  assertSelf(Math.abs(nextSweepAngleServerTime(0, 0, 0) - 400) < 1e-9, 'angle-0 rising edge occurs at +400ms');
+  const t30 = nextSweepAngleServerTime(0, 0, 30);
+  assertSelf(Math.abs(sweepAngleDeg(t30)) - 30 < 1e-6 && Math.abs(sweepAngleDeg(t30) - 30) < 1e-6, 'targeted sweep time maps back to +30 degrees');
+  const t30Future = nextSweepAngleServerTime(0, 5000, 30);
+  assertSelf(t30Future > 5000 && Math.abs(sweepAngleDeg(t30Future) - 30) < 1e-6, 'future occurrence stays on the +30 rising edge');
+
+  // Synthetic sidespin serve (side-L world ω = +Y): the probe's own rederivation
+  // must agree with itself, a 20cm-perturbed landing must fail, and Magnus must
+  // shift the landing materially vs the spin-free twin.
+  const spinningLaunch: BallLaunch = {
+    origin: { x: 0, y: 1.7, z: -7 },
+    velocity: { x: 0, y: 6.5, z: 7.8 }, // lofted enough to clear the 2.43 net
+    omega: { x: 0, y: 6.7, z: 0 },
+    arcType: 'serve',
+    quality: 1,
+    gravity: GRAVITY,
+    serverTime: 1000,
+    rngSeed: 1,
+  };
+  const localEv = firstEvent(spinningLaunch, CURVE_HORIZON_MS);
+  assertSelf(localEv.kind === 'ground' || localEv.kind === 'out', `synthetic spinning serve lands (got ${localEv.kind})`);
+  const landingCause = localEv.kind as DeathEvent['cause'];
+  const selfChain = assertChainConsistency('self', [spinningLaunch], localEv.pos, landingCause);
+  assertSelf(selfChain.pass, `chain consistency on own rederivation rejected: ${selfChain.detail}`);
+  const driftedLanding = { x: localEv.pos.x + 0.2, y: localEv.pos.y, z: localEv.pos.z };
+  assertSelf(!assertChainConsistency('self', [spinningLaunch], driftedLanding, landingCause).pass, '20cm-drifted landing accepted');
+  assertSelf(magnusShiftOf(spinningLaunch) >= CURVE_MIN_LANDING_SHIFT, 'sidespin launch lacks a material Magnus landing shift');
+
+  // Two-launch chain: a continuation whose origin sits ON the first trajectory
+  // passes the link check; a 20cm-off origin fails it.
+  const mid = ballPosition(spinningLaunch, 500);
+  const chainedLaunch: BallLaunch = {
+    ...spinningLaunch,
+    origin: mid,
+    omega: { x: 0, y: 3.35, z: 0 },
+    serverTime: 1500,
+    isNetTouch: true,
+  };
+  const chainedEv = firstEvent(chainedLaunch, CURVE_HORIZON_MS);
+  const goodChain = assertChainConsistency('self', [spinningLaunch, chainedLaunch], chainedEv.pos, chainedEv.kind as DeathEvent['cause']);
+  assertSelf(goodChain.pass, `on-trajectory chain link rejected: ${goodChain.detail}`);
+  const badLink: BallLaunch = { ...chainedLaunch, origin: { x: mid.x + 0.2, y: mid.y, z: mid.z } };
+  assertSelf(
+    !assertChainConsistency('self', [spinningLaunch, badLink], firstEvent(badLink, CURVE_HORIZON_MS).pos, 'ground').pass,
+    '20cm-off chain link accepted',
+  );
+
+  // Spin signatures: sidespin is vertical +Y; topspin is horizontal; cross-reject.
+  assertSelf(
+    assertSpinSignature('self side-L', spinningLaunch, { minMag: 4, maxMag: 9, axis: 'vertical', requirePositiveY: true }).pass,
+    'valid sidespin signature rejected',
+  );
+  assertSelf(
+    !assertSpinSignature('self cross', spinningLaunch, { minMag: 4, maxMag: 9, axis: 'horizontal' }).pass,
+    'vertical ω accepted as topspin',
+  );
+  const topLaunch: BallLaunch = { ...spinningLaunch, omega: { x: 31.5, y: 0, z: 0 } };
+  assertSelf(
+    assertSpinSignature('self top', topLaunch, { minMag: CURVE_SPIKE_MIN_OMEGA, maxMag: SPIN_MAX + 0.1, axis: 'horizontal' }).pass,
+    'valid topspin signature rejected',
+  );
+  const band30 = serveSpinBand(30);
+  assertSelf(band30.min < (30 / 90) * SERVE_SIDESPIN_MAX && band30.max > (30 / 90) * SERVE_SIDESPIN_MAX, 'serve spin band straddles the nominal rate');
+
+  console.log('self-test PASS: clock mapping, jump arc/apex, dive outcome, serve-angle, and curve-probe helpers');
 }
 
 async function runMatrix(options: CliOptions): Promise<boolean> {
@@ -1604,6 +2403,12 @@ async function main(): Promise<void> {
     const angleResult = await runAngleProbe(options.url, options.players, options.samples, options.timeoutMs);
     printAngleResult(angleResult);
     ok = angleResult.pass && ok;
+  }
+
+  if (options.probe === 'all' || options.probe === 'curve') {
+    const curveResult = await runCurveProbe(options.url, options.players, options.samples, options.timeoutMs);
+    printCurveResult(curveResult);
+    ok = curveResult.pass && ok;
   }
 
   if (!ok) {

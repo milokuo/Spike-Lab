@@ -108,6 +108,16 @@ export const MENU_ORBIT_HEIGHT = 6; // units above the court
 export const MENU_ORBIT_SPEED = 0.05; // rad/s angular velocity
 export const MENU_ORBIT_LOOK_Y = 1; // lookAt(0, this, 0) — just above the net base
 
+// M3.0a §6/§8.7 — ball spin visuals (client-only, purely cosmetic). BallView
+// integrates the mesh's own rotation every frame from the CURRENT launch's
+// decayed omega (shared @spike/shared ballOmega — an existing pure fn we only
+// READ from for rendering; no new gameplay coupling, no judged behavior).
+export const SPIN_VISUAL_RATE_MULT = 1; // mesh spin angle-rate = |omega| × this; tune here for readability, never in shared
+export const SPIN_VISUAL_EPSILON_RAD_S = 0.01; // below this |omega|, skip the rotation step (avoid normalizing ~0 vectors)
+export const SPIN_TRAIL_THRESH_RAD_S = 24; // |omega| above this thickens/lengthens the TRAIL_GHOSTS afterimage trail
+export const TRAIL_SPIN_OPACITY_MULT = 1.6; // per-ghost opacity multiplier while spin is above the threshold
+export const BALL_SEAM_TEX_SIZE = 128; // seam CanvasTexture width (height = width/2, equirectangular)
+
 // M2.9 §1/§5 — practice room create option. The wire literal is FIXED by the
 // m2.9 spec (§1): client.create(ROOM_NAME, { mode: 'practice' }). Absent/unknown
 // values are treated as a versus room by the server (no throw). WP3 unify: the

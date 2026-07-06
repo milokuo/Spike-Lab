@@ -4,7 +4,6 @@
 import {
   SERVE_BASE_SPEED,
   SERVE_JUMP_SPEED_MULT,
-  SERVE_QUALITY_JUMP,
   GRAVITY,
   NET_HEIGHT,
   chargeDistanceMult,
@@ -57,7 +56,12 @@ export function solveJumpLoft(originY: number, distToNet: number, angleDeg: numb
   const forwardSpeed = Math.max(0.5, speed * Math.cos(angleRad) * JUMP_HORIZ_FRAC);
   const t = distToNet / forwardSpeed; // time to reach the net plane
   const vyNeeded = (NET_HEIGHT + JUMP_NET_MARGIN - originY) / t + 0.5 * GRAVITY * t;
-  const heightFactor = Math.sqrt(0.5 + 0.5 * SERVE_QUALITY_JUMP); // §6.3.1, matches buildBallLaunch
-  const loft = vyNeeded / (speed * heightFactor);
+  // M3.0a P1 removed buildBallLaunch's quality-driven heightFactor multiply
+  // (quality is now informational-only, see ballistics/launch.ts) — this solve
+  // no longer needs to pre-compensate for it. Previously divided vyNeeded by
+  // sqrt(0.5 + 0.5*SERVE_QUALITY_JUMP) (~0.987) to cancel a downstream
+  // multiply that no longer exists; that was a dead reference to a deleted
+  // mechanism (docs/knowledge/pitfalls.md).
+  const loft = vyNeeded / speed;
   return Math.min(0.5, Math.max(-0.1, loft));
 }

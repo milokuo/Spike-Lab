@@ -77,3 +77,13 @@ practice 房自己接的**下一次**觸球，形狀上與 versus 的 `illegal_d
 才不會每 30Hz 跳一格。`LocalPlayer` 的 `moveVelWorld × leadS`（between-tick motion lead）與
 `tickJump` 每幀積分即此。lead 是純視覺、不進 `groundPos`，跨對帳自抵消。
 > **解藥**：新增任何 input-cadence 積分量時，配一個 render-frame 的 visual lead（netcode.md §5）。
+
+## 12. 舊機制刪除時，係數殘留成為死引用（幽靈耦合）
+M3.0a P1 把 `buildBallLaunch` 的 quality→scatter/heightFactor 兩個效果都刪了（quality 改純資訊
+性，噪聲改由 fidelity 模型統一負責），但 `serveAim.ts solveJumpLoft` 仍除以舊 heightFactor
+（`sqrt(0.5+0.5·SERVE_QUALITY_JUMP)≈0.987`）去「預先抵消」一個下游已經不存在的乘回——沒有測試
+把跳發 vy 的絕對量釘死，所以這條死引用活了一整輪才被對抗式審查抓到。
+> **解藥**：刪除/改版任一舊機制（quality 管線、scatter、任何「pipeline」型公式）時，**全庫 grep
+> 該機制的係數/中間變數名**（如本例的 `heightFactor`／`SERVE_QUALITY_JUMP`），確認每個引用點都
+> 跟著更新或有明確理由保留。光看呼叫端測試綠燈不夠——绿灯可能只是沒人斷言那個量的絕對值
+> （physics-flight.md §3）。

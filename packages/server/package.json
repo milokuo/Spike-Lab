@@ -1,0 +1,27 @@
+{
+  "name": "@spike/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "serve": "tsx test/serve.ts",
+    "smoke": "tsx test/smoke.ts",
+    "integration": "tsx test/integration.ts",
+    "practice": "tsx test/practice.ts"
+  },
+  "dependencies": {
+    "@colyseus/schema": "^3.0.0",
+    "@spike/shared": "*",
+    "colyseus": "^0.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "colyseus.js": "^0.16.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "spike-lab",
+  "private": true,
+  "workspaces": [
+    "packages/shared",
+    "packages/server",
+    "packages/client"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build:shared": "npm run build -w @spike/shared",
+    "test": "npm test -w @spike/shared",
+    "typecheck": "npm run typecheck -w @spike/shared",
+    "dev:server": "npm run dev -w @spike/server",
+    "dev:client": "npm run dev -w @spike/client",
+    "dev": "npm run build:shared && concurrently -k \"npm:dev:server\" \"npm:dev:client\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "typescript": "^5.6.3"
+  }
+}
